@@ -206,6 +206,17 @@ class LanguageModelSAERunnerConfig:
     compile_sae: bool = False  # use torch.compile on the SAE
     sae_compilation_mode: str | None = None
 
+    # FSDP Parameters
+    fsdp_enabled: bool = False
+    fsdp_sharding_strategy: str = "FULL_SHARD"  # alternativas: SHARD_GRAD_OP, NO_SHARD, HYBRID_SHARD
+    fsdp_auto_wrap_policy: str | None = None  # e.g. transformer_auto_wrap_policy
+    fsdp_transformer_layer_cls_to_wrap: list[str] | None = field(default_factory=list) # e.g. ["GPT2Block", "LlamaDecoderLayer"]
+    fsdp_offload_params: bool = False
+    fsdp_cpu_ram_efficient_loading: bool = True
+    fsdp_sync_module_states: bool = True
+    fsdp_use_orig_params: bool = True
+
+
     # Training Parameters
 
     ## Batch size
@@ -261,6 +272,7 @@ class LanguageModelSAERunnerConfig:
     resume: bool = False
     n_checkpoints: int = 0
     checkpoint_path: str = "checkpoints"
+    resume_from_checkpoint_folder: str | None = None
     verbose: bool = True
     model_kwargs: dict[str, Any] = dict_field(default={})
     model_from_pretrained_kwargs: dict[str, Any] | None = dict_field(default=None)

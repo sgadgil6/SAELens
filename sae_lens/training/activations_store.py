@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformer_lens.hook_points import HookedRootModule
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from accelerate import Accelerator # Added for FSDP
 
 from sae_lens import logger
 from sae_lens.config import (
@@ -48,9 +49,10 @@ class ActivationsStore:
     hook_layer: int
     hook_head_index: int | None
     _dataloader: Iterator[Any] | None = None
-    _storage_buffer: torch.Tensor | None = None
+    _storage_buffer: torch.Tensor | None = None # This will store (activations, tokens_if_present)
     exclude_special_tokens: torch.Tensor | None = None
-    device: torch.device
+    device: torch.device # Device for the storage buffer (usually CPU)
+    accelerator: Accelerator | None = None # For distributed activation generation
 
     @classmethod
     def from_cache_activations(
@@ -85,6 +87,7 @@ class ActivationsStore:
             autocast_lm=False,
             dataset_trust_remote_code=None,
             exclude_special_tokens=None,
+            accelerator=None, # Added
         )
 
     @classmethod
@@ -93,8 +96,11 @@ class ActivationsStore:
         model: HookedRootModule,
         cfg: LanguageModelSAERunnerConfig | CacheActivationsRunnerConfig,
         override_dataset: HfDataset | None = None,
+        accelerator: Accelerator | None = None, # Added
     ) -> ActivationsStore:
         if isinstance(cfg, CacheActivationsRunnerConfig):
+            # Note: CacheActivationsRunnerConfig does not have fsdp settings, so accelerator is not passed here.
+            # If cached activations were generated in an FSDP context, they should already be gathered.
             return cls.from_cache_activations(model, cfg)
 
         cached_activations_path = cfg.cached_activations_path
@@ -143,6 +149,7 @@ class ActivationsStore:
             dataset_trust_remote_code=cfg.dataset_trust_remote_code,
             seqpos_slice=cfg.seqpos_slice,
             exclude_special_tokens=exclude_special_tokens,
+            accelerator=accelerator, # Added
         )
 
     @classmethod
@@ -176,8 +183,9 @@ class ActivationsStore:
             normalize_activations=sae.cfg.normalize_activations,
             dataset_trust_remote_code=sae.cfg.dataset_trust_remote_code,
             dtype=sae.cfg.dtype,
-            device=torch.device(device),
+            device=torch.device(device), # storage device
             seqpos_slice=sae.cfg.seqpos_slice,
+            accelerator=None, # Not typically used when loading from SAE directly like this
         )
 
     def __init__(
@@ -204,8 +212,10 @@ class ActivationsStore:
         dataset_trust_remote_code: bool | None = None,
         seqpos_slice: tuple[int | None, ...] = (None,),
         exclude_special_tokens: torch.Tensor | None = None,
+        accelerator: Accelerator | None = None, # Added
     ):
-        self.model = model
+        self.model = model # This model might be FSDP wrapped by the runner
+        self.accelerator = accelerator
         if model_kwargs is None:
             model_kwargs = {}
         self.model_kwargs = model_kwargs
@@ -241,6 +251,8 @@ class ActivationsStore:
         self.train_batch_size_tokens = train_batch_size_tokens
         self.prepend_bos = prepend_bos
         self.normalize_activations = normalize_activations
+        # self.device is for the activation *store* (buffer), typically CPU.
+        # The model itself will run on self.accelerator.device if accelerator is used.
         self.device = torch.device(device)
         self.dtype = DTYPE_MAP[dtype]
         self.cached_activations_path = cached_activations_path
@@ -512,10 +524,12 @@ class ActivationsStore:
                     )
                 sequences.append(next(self.iterable_sequences))
 
-        return torch.stack(sequences, dim=0).to(_get_model_device(self.model))
+        # If accelerator is used, move to its device, otherwise _get_model_device
+        target_device = self.accelerator.device if self.accelerator and hasattr(self.accelerator, "device") else _get_model_device(self.model)
+        return torch.stack(sequences, dim=0).to(target_device)
 
     @torch.no_grad()
-    def get_activations(self, batch_tokens: torch.Tensor):
+    def get_activations(self, batch_tokens: torch.Tensor): # batch_tokens are on accelerator.device or model's device
         """
         Returns activations of shape (batches, context, num_layers, d_in)
 
@@ -547,27 +561,48 @@ class ActivationsStore:
 
         n_batches, n_context = layerwise_activations.shape[:2]
 
-        stacked_activations = torch.zeros((n_batches, n_context, 1, self.d_in))
+        stacked_activations = torch.zeros((n_batches, n_context, 1, self.d_in), device=layerwise_activations.device) # Keep on same device as input for now
 
         if self.hook_head_index is not None:
-            stacked_activations[:, :, 0] = layerwise_activations[
+            processed_layer_acts = layerwise_activations[
                 :, :, self.hook_head_index
             ]
         elif layerwise_activations.ndim > 3:  # if we have a head dimension
             try:
-                stacked_activations[:, :, 0] = layerwise_activations.view(
+                processed_layer_acts = layerwise_activations.view(
                     n_batches, n_context, -1
                 )
             except RuntimeError as e:
                 logger.error(f"Error during view operation: {e}")
                 logger.info("Attempting to use reshape instead...")
-                stacked_activations[:, :, 0] = layerwise_activations.reshape(
+                processed_layer_acts = layerwise_activations.reshape(
                     n_batches, n_context, -1
                 )
         else:
-            stacked_activations[:, :, 0] = layerwise_activations
+            processed_layer_acts = layerwise_activations
 
-        return stacked_activations
+        stacked_activations[:, :, 0] = processed_layer_acts
+
+        # Gather activations if running in a distributed environment
+        if self.accelerator is not None and self.accelerator.num_processes > 1:
+            # stacked_activations is currently (local_batch_on_this_rank, context, 1, d_in)
+            # We need to gather across the batch dimension.
+            # accelerator.gather reshapes based on the first dimension.
+            # Let's reshape to (local_batch_on_this_rank, features) then gather, then reshape back.
+            original_shape = stacked_activations.shape
+            local_batch_size = original_shape[0]
+            features_dim = original_shape[1] * original_shape[2] * original_shape[3]
+
+            reshaped_for_gather = stacked_activations.reshape(local_batch_size, features_dim)
+            gathered_reshaped = self.accelerator.gather(reshaped_for_gather)
+
+            # Reshape back to (global_batch_size, context, 1, d_in)
+            # The first dimension of gathered_reshaped is now global_batch_size
+            global_batch_size = gathered_reshaped.shape[0]
+            expected_shape = (global_batch_size, original_shape[1], original_shape[2], original_shape[3])
+            stacked_activations = gathered_reshaped.reshape(expected_shape)
+
+        return stacked_activations # On each process, this is now the *full* batch of activations
 
     def _load_buffer_from_cached(
         self,
@@ -581,64 +616,139 @@ class ActivationsStore:
         Int[torch.Tensor, "(total_size context_size)"] | None,
     ]:
         """
-        Loads `total_size` activations from `cached_activation_dataset`
-
+        Loads `total_size` activations from `cached_activation_dataset`.
+        If running in a distributed environment, each process loads a shard of the data,
+        and then the activations are gathered.
         The dataset has columns for each hook_name,
         each containing activations of shape (context_size, d_in).
-
-        raises StopIteration
+        Raises StopIteration if the dataset is exhausted and raise_on_epoch_end is True.
         """
         assert self.cached_activation_dataset is not None
-        # In future, could be a list of multiple hook names
-        hook_names = [self.hook_name]
+        hook_names = [self.hook_name] # In future, could be a list of multiple hook names
         if not set(hook_names).issubset(self.cached_activation_dataset.column_names):
             raise ValueError(
                 f"Missing columns in dataset. Expected {hook_names}, "
                 f"got {self.cached_activation_dataset.column_names}."
             )
 
-        if self.current_row_idx > len(self.cached_activation_dataset) - total_size:
+        dataset_len = len(self.cached_activation_dataset)
+
+        # Determine the global range of data to load for this buffer refill
+        global_start_idx = self.current_row_idx
+
+        # Calculate the actual number of samples we can load in this pass globally
+        if global_start_idx >= dataset_len:
+            self.current_row_idx = 0 # Reset for next epoch
+            if raise_on_epoch_end:
+                raise StopIteration("Dataset exhausted at start of buffer load.")
+            global_start_idx = 0 # Start from beginning for non-epoch-raising case
+
+        # Determine how many samples can be loaded globally for this iteration
+        # This is total_size unless we are at the end of the dataset.
+        num_globally_available_from_start_idx = dataset_len - global_start_idx
+        current_global_load_size = min(total_size, num_globally_available_from_start_idx)
+
+        if current_global_load_size <= 0: # Should not happen if global_start_idx was reset correctly
             self.current_row_idx = 0
             if raise_on_epoch_end:
-                raise StopIteration
+                 raise StopIteration("No data to load, dataset possibly smaller than buffer or exhausted.")
+            # If not raising, try to load from beginning again if possible
+            global_start_idx = 0
+            current_global_load_size = min(total_size, dataset_len)
+            if current_global_load_size <= 0: # Still no data (e.g. empty dataset)
+                return torch.empty((0, num_layers, d_in), dtype=self.dtype, device=self.device), None
 
-        new_buffer = []
-        ds_slice = self.cached_activation_dataset[
-            self.current_row_idx : self.current_row_idx + total_size
-        ]
-        for hook_name in hook_names:
-            # Load activations for each hook.
-            # Usually faster to first slice dataset then pick column
-            _hook_buffer = ds_slice[hook_name]
-            if _hook_buffer.shape != (total_size, context_size, d_in):
-                raise ValueError(
-                    f"_hook_buffer has shape {_hook_buffer.shape}, "
-                    f"but expected ({total_size}, {context_size}, {d_in})."
-                )
-            new_buffer.append(_hook_buffer)
 
-        # Stack across num_layers dimension
-        # list of num_layers; shape: (total_size, context_size, d_in) -> (total_size, context_size, num_layers, d_in)
-        new_buffer = torch.stack(new_buffer, dim=2)
-        if new_buffer.shape != (total_size, context_size, num_layers, d_in):
-            raise ValueError(
-                f"new_buffer has shape {new_buffer.shape}, "
-                f"but expected ({total_size}, {context_size}, {num_layers}, {d_in})."
-            )
+        global_indices_to_load = list(range(global_start_idx, global_start_idx + current_global_load_size))
 
-        self.current_row_idx += total_size
-        acts_buffer = new_buffer.reshape(total_size * context_size, num_layers, d_in)
+        acts_buffer_local_list = []
+        token_ids_buffer_local = None # Placeholder for local token ids
 
-        if "token_ids" not in self.cached_activation_dataset.column_names:
-            return acts_buffer, None
+        # Distributed loading logic vs single process
+        if self.accelerator is not None and self.accelerator.num_processes > 1:
+            process_index = self.accelerator.process_index
+            num_processes = self.accelerator.num_processes
 
-        token_ids_buffer = ds_slice["token_ids"]
-        if token_ids_buffer.shape != (total_size, context_size):
-            raise ValueError(
-                f"token_ids_buffer has shape {token_ids_buffer.shape}, "
-                f"but expected ({total_size}, {context_size})."
-            )
-        token_ids_buffer = token_ids_buffer.reshape(total_size * context_size)
+            with self.accelerator.split_between_processes(global_indices_to_load, apply_padding=False) as local_indices_this_process_padded:
+                # Slicing HF dataset with an empty list is problematic, ensure indices are present
+                if not local_indices_this_process_padded:
+                    local_ds_slice = None
+                else:
+                    # Datasets expect list of ints for slicing, not tensors.
+                    local_indices_list = [int(i) for i in local_indices_this_process_padded]
+                    local_ds_slice = self.cached_activation_dataset[local_indices_list]
+
+            if local_ds_slice and len(local_ds_slice[self.hook_name]) > 0:
+                for hook_name_iter in hook_names: # Usually just one hook_name
+                    # _hook_buffer_local is (local_slice_len, context_size, d_in)
+                    _hook_buffer_local = local_ds_slice[hook_name_iter]
+                    acts_buffer_local_list.append(_hook_buffer_local)
+
+                if "token_ids" in self.cached_activation_dataset.column_names:
+                    token_ids_buffer_local = local_ds_slice["token_ids"] # (local_slice_len, context_size)
+
+            # Prepare for gather - all tensors must be on the accelerator's device
+            # And they must have the same shape on all processes for gather, or use gather_object
+            # For tensor gather, if a process has no data, it should contribute an empty tensor of correct ndim & device.
+
+            if acts_buffer_local_list: # If this process loaded some data
+                local_acts_stacked = torch.stack(acts_buffer_local_list, dim=2).to(self.accelerator.device) # (local_slice_len, context_size, num_layers, d_in)
+                original_shape_local = local_acts_stacked.shape
+                local_slice_len = original_shape_local[0]
+                features_dim = original_shape_local[1] * original_shape_local[2] * original_shape_local[3]
+                reshaped_for_gather = local_acts_stacked.reshape(local_slice_len, features_dim)
+            else: # This process had no data for this global batch part
+                local_slice_len = 0 # For clarity
+                features_dim = context_size * num_layers * d_in
+                reshaped_for_gather = torch.empty((0, features_dim), dtype=self.dtype, device=self.accelerator.device)
+
+            # Gather activations across all processes
+            gathered_reshaped_acts = self.accelerator.gather(reshaped_for_gather)
+            # Reshape back to (current_global_load_size, context_size, num_layers, d_in)
+            acts_buffer = gathered_reshaped_acts.reshape(current_global_load_size, context_size, num_layers, d_in)
+
+            if "token_ids" in self.cached_activation_dataset.column_names:
+                if token_ids_buffer_local is not None and token_ids_buffer_local.nelement() > 0:
+                    token_ids_buffer_local_on_device = token_ids_buffer_local.to(self.accelerator.device)
+                    reshaped_tokens_for_gather = token_ids_buffer_local_on_device.reshape(local_slice_len, -1)
+                else:
+                    reshaped_tokens_for_gather = torch.empty((0, context_size), dtype=torch.long, device=self.accelerator.device)
+
+                gathered_reshaped_tokens = self.accelerator.gather(reshaped_tokens_for_gather)
+                token_ids_buffer = gathered_reshaped_tokens.reshape(current_global_load_size, context_size)
+            else:
+                token_ids_buffer = None
+
+        else: # Single process logic
+            ds_slice = self.cached_activation_dataset[global_indices_to_load]
+            for hook_name_iter in hook_names:
+                _hook_buffer = ds_slice[hook_name_iter]
+                acts_buffer_local_list.append(_hook_buffer)
+
+            acts_buffer = torch.stack(acts_buffer_local_list, dim=2) # (current_global_load_size, context_size, num_layers, d_in)
+
+            if "token_ids" in self.cached_activation_dataset.column_names:
+                token_ids_buffer = ds_slice["token_ids"] # (current_global_load_size, context_size)
+            else:
+                token_ids_buffer = None
+
+        # Advance current_row_idx by the amount of data processed globally
+        self.current_row_idx = global_start_idx + current_global_load_size
+        if self.current_row_idx >= dataset_len: # Reset if reached or passed end
+            self.current_row_idx = 0
+            if raise_on_epoch_end and (global_start_idx + current_global_load_size) >= dataset_len :
+                 raise StopIteration("Dataset exhausted during _load_buffer_from_cached.")
+
+        # Reshape to (total_tokens_in_buffer_for_this_load, num_layers, d_in)
+        # acts_buffer is already on self.device (CPU) if not distributed, or gathered to all devices then moved.
+        # Ensure it's on the ActivationsStore's designated device (e.g. CPU)
+        acts_buffer = acts_buffer.to(self.device)
+        acts_buffer = acts_buffer.reshape(current_global_load_size * context_size, num_layers, d_in)
+
+        if token_ids_buffer is not None:
+            token_ids_buffer = token_ids_buffer.to(self.device)
+            token_ids_buffer = token_ids_buffer.reshape(current_global_load_size * context_size)
+
         return acts_buffer, token_ids_buffer
 
     @torch.no_grad()
@@ -683,26 +793,72 @@ class ActivationsStore:
         for refill_batch_idx_start in tqdm(
             refill_iterator, leave=False, desc="Refilling buffer"
         ):
-            # move batch toks to gpu for model
+            # get_batch_tokens already places on self.accelerator.device if accelerator is present
             refill_batch_tokens = self.get_batch_tokens(
                 raise_at_epoch_end=raise_on_epoch_end
-            ).to(_get_model_device(self.model))
+            )
+            # get_activations will handle gathering if distributed.
+            # refill_activations will be the full global batch on all processes.
             refill_activations = self.get_activations(refill_batch_tokens)
-            # move acts back to cpu
-            refill_activations.to(self.device)
-            new_buffer_activations[
-                refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
-            ] = refill_activations
 
-            # handle seqpos_slice, this is done for activations in get_activations
-            refill_batch_tokens = refill_batch_tokens[:, slice(*self.seqpos_slice)]
+            # The buffer is on self.device (e.g. CPU). Move activations there.
+            # If FSDP is used, refill_activations might be on each rank's GPU.
+            # Ensure it's moved to the buffer's device.
+            refill_activations = refill_activations.to(self.device)
+
+            # Store the full batch of activations.
+            # If store_batch_size_prompts was global batch size, this is correct.
+            # If it was per-device, then this needs adjustment based on num_processes.
+            # Assuming self.store_batch_size_prompts is the global batch size for LLM.
+            current_global_batch_size = refill_activations.shape[0]
+
+
+            # Only the main process should write to the buffer if we want to avoid redundant storage
+            # and ensure correct batch accounting for the final SAE training dataloader,
+            # UNLESS all processes will maintain an identical buffer and dataloader.
+            # For now, let's assume all processes build an identical buffer.
+            # This simplifies dataloading for the SAE later if it's also distributed (e.g. DDP).
+            # The new_buffer_activations is sized for total_size = self.store_batch_size_prompts * n_batches_in_buffer.
+            # If store_batch_size_prompts means global batch size, then this is fine.
+
+            # The refill_iterator is based on self.store_batch_size_prompts.
+            # If store_batch_size_prompts = global batch size for LLM fwd pass.
+            # And refill_activations is (global_batch_size, context, num_layers, d_in)
+            # Then this slice is correct.
+            idx_end = refill_batch_idx_start + current_global_batch_size
+            if idx_end > new_buffer_activations.shape[0]: # Handle cases where the last batch might be smaller
+                idx_end = new_buffer_activations.shape[0]
+                current_global_batch_size = idx_end - refill_batch_idx_start
+                refill_activations = refill_activations[:current_global_batch_size]
+
+
+            new_buffer_activations[
+                refill_batch_idx_start : idx_end, ...
+            ] = refill_activations # refill_activations is (global_batch_size, ...)
+
+            # Corresponding tokens for this global batch
+            # refill_batch_tokens was (global_batch_size, original_context_size)
+            # We need to slice it like activations were sliced by seqpos_slice
+            sliced_tokens = refill_batch_tokens[:, slice(*self.seqpos_slice)]
+            # And then move to the buffer's device.
             new_buffer_token_ids[
-                refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
-            ] = refill_batch_tokens
+                refill_batch_idx_start : idx_end, ...
+            ] = sliced_tokens[:current_global_batch_size].to(self.device)
+
 
         new_buffer_activations = new_buffer_activations.reshape(-1, num_layers, d_in)
         new_buffer_token_ids = new_buffer_token_ids.reshape(-1)
+
+        # Shuffle on all processes identically if they all have the full buffer.
+        # Requires synchronized random state or ensuring torch.randperm is same if seed is managed.
+        # For simplicity, if accelerator is present, let main process shuffle and then broadcast,
+        # or let each process shuffle (if data is identical, shuffle will be too with same seed).
+        # For now, assume shuffle happens on all processes over identical data.
         if shuffle:
+            # Ensure consistent shuffling across processes if they all have the same data.
+            # This usually means setting the same seed before this operation if not already done globally.
+            # Or, main process shuffles and broadcasts indices.
+            # For now, let's assume simple identical shuffle due to identical data.
             new_buffer_activations, new_buffer_token_ids = permute_together(
                 [new_buffer_activations, new_buffer_token_ids]
             )
@@ -787,19 +943,36 @@ class ActivationsStore:
             self._dataloader = self.get_data_loader()
             return next(self.dataloader)
 
-    def state_dict(self) -> dict[str, torch.Tensor]:
+    def state_dict(self) -> dict[str, Any]:
+        # _storage_buffer directly stores the filtered activation tensor,
+        # not a tuple (activations, tokens). Tokens are used for filtering but not stored in this attribute.
         result = {
-            "n_dataset_processed": torch.tensor(self.n_dataset_processed),
+            "n_dataset_processed": self.n_dataset_processed,
+            "current_row_idx": self.current_row_idx,
+            "estimated_norm_scaling_factor": self.estimated_norm_scaling_factor,
+            "_storage_buffer": self._storage_buffer, # This is Tensor | None
         }
-        if self._storage_buffer is not None:  # first time might be None
-            result["storage_buffer_activations"] = self._storage_buffer[0]
-            if self._storage_buffer[1] is not None:
-                result["storage_buffer_tokens"] = self._storage_buffer[1]
-        if self.estimated_norm_scaling_factor is not None:
-            result["estimated_norm_scaling_factor"] = torch.tensor(
-                self.estimated_norm_scaling_factor
-            )
         return result
+
+    def load_state_dict(self, state_dict: dict[str, Any]):
+        self.n_dataset_processed = state_dict.get("n_dataset_processed", 0)
+        self.current_row_idx = state_dict.get("current_row_idx", 0)
+        self.estimated_norm_scaling_factor = state_dict.get("estimated_norm_scaling_factor")
+
+        # Load the activations tensor into _storage_buffer
+        self._storage_buffer = state_dict.get("_storage_buffer") # This will be Tensor | None
+
+        # Crucially, reset the dataloader so it's recreated with the new buffer if needed
+        self._dataloader = None
+
+        # Resetting iterable_sequences to force re-evaluation from the new n_dataset_processed/current_row_idx.
+        # This is a simplification. True state restoration of arbitrary generators is hard.
+        # For map-style datasets, _iterate_raw_dataset will use n_dataset_processed.
+        # For IterableDatasets, it will restart the stream; n_dataset_processed is for accounting.
+        # If cached_activation_dataset is used, current_row_idx will take effect when _load_buffer_from_cached is called.
+        if self.cached_activations_path is None: # Only reset iterable_sequences if not using cache primarily
+             self.iterable_sequences = self._iterate_tokenized_sequences()
+        # If using cached_activations, current_row_idx is the primary cursor. iterable_sequences might not be used.
 
     def save(self, file_path: str):
         """save the state dict to a file in safetensors format"""

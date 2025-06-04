@@ -4,6 +4,7 @@ from typing import Any, Protocol, cast
 
 import torch
 import wandb
+from accelerate import Accelerator
 from torch.optim import Adam
 from tqdm import tqdm
 from transformer_lens.hook_points import HookedRootModule
@@ -64,12 +65,14 @@ class SAETrainer:
         activation_store: ActivationsStore,
         save_checkpoint_fn: SaveCheckpointFn,
         cfg: LanguageModelSAERunnerConfig,
+        accelerator: Accelerator,
     ) -> None:
         self.model = model
         self.sae = sae
         self.activations_store = activation_store
         self.save_checkpoint = save_checkpoint_fn
         self.cfg = cfg
+        self.accelerator = accelerator
 
         self.n_training_steps: int = 0
         self.n_training_tokens: int = 0
@@ -89,11 +92,11 @@ class SAETrainer:
 
         self.act_freq_scores = torch.zeros(
             cast(int, cfg.d_sae),
-            device=cfg.device,
+            device=cfg.device,  # These are not directly part of model/optimizer/dataloader, keep on cfg.device for now
         )
         self.n_forward_passes_since_fired = torch.zeros(
             cast(int, cfg.d_sae),
-            device=cfg.device,
+            device=cfg.device,  # These are not directly part of model/optimizer/dataloader, keep on cfg.device for now
         )
         self.n_frac_active_tokens = 0
         # we don't train the scaling factor (initially)
@@ -110,6 +113,13 @@ class SAETrainer:
                 cfg.adam_beta2,
             ),
         )
+
+        # Prepare optimizer and dataloader (activation_store)
+        # SAE and model are already prepared in the runner
+        self.optimizer, self.activations_store = self.accelerator.prepare(
+            self.optimizer, self.activations_store
+        )
+
         assert cfg.lr_end is not None  # this is set in config post-init
         self.lr_scheduler = get_lr_scheduler(
             cfg.lr_scheduler_name,
@@ -127,19 +137,14 @@ class SAETrainer:
             final_l1_coefficient=cfg.l1_coefficient,
         )
 
-        # Setup autocast if using
-        self.scaler = torch.amp.GradScaler(
-            device=self.cfg.device, enabled=self.cfg.autocast
+        # Register L1 scheduler and other tensors for checkpointing
+        self.accelerator.register_for_checkpointing(
+            self.l1_scheduler, self.act_freq_scores, self.n_forward_passes_since_fired
         )
 
-        if self.cfg.autocast:
-            self.autocast_if_enabled = torch.autocast(
-                device_type=self.cfg.device,
-                dtype=torch.bfloat16,
-                enabled=self.cfg.autocast,
-            )
-        else:
-            self.autocast_if_enabled = contextlib.nullcontext()
+        # Accelerator handles mixed precision and gradient scaling.
+        # self.scaler = torch.amp.GradScaler(...) # Removed
+        # self.autocast_if_enabled = contextlib.nullcontext() # Removed
 
         # Set up eval config
 
@@ -179,9 +184,8 @@ class SAETrainer:
         # Train loop
         while self.n_training_tokens < self.cfg.total_training_tokens:
             # Do a training step.
-            layer_acts = self.activations_store.next_batch()[:, 0, :].to(
-                self.sae.device
-            )
+            # layer_acts are on the correct device thanks to accelerator.prepare(self.activations_store)
+            layer_acts = self.activations_store.next_batch()[:, 0, :]
             self.n_training_tokens += self.cfg.train_batch_size_tokens
 
             step_output = self._train_step(sae=self.sae, sae_in=layer_acts)
@@ -228,36 +232,39 @@ class SAETrainer:
         if (self.n_training_steps + 1) % self.cfg.feature_sampling_window == 0:
             if self.cfg.log_to_wandb:
                 sparsity_log_dict = self._build_sparsity_log_dict()
-                wandb.log(sparsity_log_dict, step=self.n_training_steps)
+                self.accelerator.log(sparsity_log_dict, step=self.n_training_steps)
             self._reset_running_sparsity_stats()
 
-        # for documentation on autocasting see:
-        # https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html
-        with self.autocast_if_enabled:
-            train_step_output = self.sae.training_forward_pass(
-                sae_in=sae_in,
-                dead_neuron_mask=self.dead_neurons,
+        # Accelerator handles autocasting if mixed precision is enabled.
+        # with self.autocast_if_enabled: # Removed
+        train_step_output = self.sae.training_forward_pass(
+            sae_in=sae_in, # sae_in is already on the correct device
+            dead_neuron_mask=self.dead_neurons,
                 current_l1_coefficient=self.current_l1_coefficient,
             )
 
-            with torch.no_grad():
-                did_fire = (train_step_output.feature_acts > 0).float().sum(-2) > 0
-                self.n_forward_passes_since_fired += 1
-                self.n_forward_passes_since_fired[did_fire] = 0
-                self.act_freq_scores += (
-                    (train_step_output.feature_acts.abs() > 0).float().sum(0)
-                )
-                self.n_frac_active_tokens += self.cfg.train_batch_size_tokens
+        with torch.no_grad():
+            # Update running statistics of feature activations
+            did_fire = (train_step_output.feature_acts > 0).float().sum(-2) > 0
+            self.n_forward_passes_since_fired += 1
+            self.n_forward_passes_since_fired[did_fire] = 0
+            self.act_freq_scores += (
+                (train_step_output.feature_acts.abs() > 0).float().sum(0)
+            )
+            self.n_frac_active_tokens += self.cfg.train_batch_size_tokens
 
-        # Scaler will rescale gradients if autocast is enabled
-        self.scaler.scale(
-            train_step_output.loss
-        ).backward()  # loss.backward() if not autocasting
-        self.scaler.unscale_(self.optimizer)  # needed to clip correctly
-        # TODO: Work out if grad norm clipping should be in config / how to test it.
-        torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
-        self.scaler.step(self.optimizer)  # just ctx.optimizer.step() if not autocasting
-        self.scaler.update()
+        # loss is scaled by accelerator.backward
+        self.accelerator.backward(train_step_output.loss)
+        # self.scaler.scale(...) # Removed
+        # self.scaler.unscale_(...) # Removed
+
+        # Grad norm clipping is handled by accelerator if configured, or by calling:
+        # self.accelerator.clip_grad_norm_(sae.parameters(), MAX_NORM_VALUE)
+        # For now, relying on Accelerator's configuration if any, or manual call if added later.
+
+        self.optimizer.step()
+        # self.scaler.step(...) # Removed
+        # self.scaler.update() # Removed
 
         if self.cfg.normalize_sae_decoder:
             sae.remove_gradient_parallel_to_decoder_directions()
@@ -271,7 +278,8 @@ class SAETrainer:
     @torch.no_grad()
     def _log_train_step(self, step_output: TrainStepOutput):
         if (self.n_training_steps + 1) % self.cfg.wandb_log_frequency == 0:
-            wandb.log(
+            # self.accelerator.log handles the check for cfg.log_to_wandb and main_process internally.
+            self.accelerator.log(
                 self._build_train_step_log_dict(
                     output=step_output,
                     n_training_tokens=self.n_training_tokens,
@@ -370,7 +378,8 @@ class SAETrainer:
                 b_mag_dist = self.sae.b_mag.detach().float().cpu().numpy()
                 eval_metrics["weights/b_mag"] = wandb.Histogram(b_mag_dist)  # type: ignore
 
-            wandb.log(
+            # self.accelerator.log handles the check for cfg.log_to_wandb and main_process internally.
+            self.accelerator.log(
                 eval_metrics,
                 step=self.n_training_steps,
             )
