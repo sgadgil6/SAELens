@@ -39,6 +39,7 @@ pytest-profiling = "^1.7.0"
 zstandard = "^0.22.0"
 typing-extensions = "^4.10.0"
 simple-parsing = "^0.1.6"
+accelerate = "^0.29.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.2"
