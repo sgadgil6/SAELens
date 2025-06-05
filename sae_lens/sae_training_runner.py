@@ -234,12 +234,19 @@ class SAETrainingRunner:
         """
 
         if self.cfg.log_to_wandb:
-            wandb.init(
-                project=self.cfg.wandb_project,
-                entity=self.cfg.wandb_entity,
-                config=cast(Any, self.cfg),
-                name=self.cfg.run_name,
-                id=self.cfg.wandb_id,
+            # Initialize wandb tracking through the accelerator
+            init_kwargs_wandb = {}
+            if self.cfg.wandb_entity:
+                init_kwargs_wandb["entity"] = self.cfg.wandb_entity
+            if self.cfg.wandb_id:
+                init_kwargs_wandb["id"] = self.cfg.wandb_id
+            if self.cfg.run_name:
+                init_kwargs_wandb["name"] = self.cfg.run_name
+
+            self.accelerator.init_trackers(
+                project_name=self.cfg.wandb_project,
+                config=self.cfg.to_dict(), # Pass all config parameters
+                init_kwargs={"wandb": init_kwargs_wandb}
             )
 
         trainer = SAETrainer(
@@ -290,7 +297,7 @@ class SAETrainingRunner:
         sae = self.run_trainer_with_interruption_handling(trainer)
 
         if self.cfg.log_to_wandb:
-            wandb.finish()
+            self.accelerator.end_training() # Replaced wandb.finish()
 
         return sae
 

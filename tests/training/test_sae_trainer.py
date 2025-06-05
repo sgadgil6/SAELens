@@ -292,3 +292,161 @@ def test_estimated_norm_scaling_factor_persistence(
 
     # Final checkpoint should NOT have the scaling factor as it's been folded into the weights
     assert "estimated_norm_scaling_factor" not in final_checkpoint
+
+
+def test_layer_acts_device_handling_with_accelerator(
+    cfg: LanguageModelSAERunnerConfig, # Use existing fixture, override device if needed
+    model: HookedTransformer, # Mocked or real, SAETrainer doesn't use it much in _train_step
+):
+    from unittest.mock import MagicMock, PropertyMock
+    from accelerate import Accelerator
+
+    # 1. Setup Accelerator
+    # For this test, a CPU accelerator is fine to check logic,
+    # but testing with CUDA would be more thorough if environment allows.
+    # If CUDA is available, use it, otherwise CPU.
+    if torch.cuda.is_available():
+        accelerator = Accelerator(device_placement=True) # Let accelerator place on its device (GPU)
+        test_device = accelerator.device
+    else:
+        accelerator = Accelerator(device_placement=True, cpu=True) # Force CPU if no CUDA
+        test_device = torch.device("cpu")
+
+    cfg.device = str(test_device) # Ensure config reflects accelerator's device for SAE model placement
+    cfg.act_store_device = "cpu" # Simulate activations coming from CPU buffer
+
+    # 2. Mock ActivationsStore
+    mock_activation_store = MagicMock(spec=ActivationsStore)
+    # Simulate next_batch() returning a tensor on CPU
+    cpu_tensor = torch.randn(cfg.train_batch_size_tokens // cfg.context_size, 1, cfg.d_in).to("cpu")
+    # The actual next_batch() in code is `self.activations_store.next_batch()[:, 0, :]`
+    # So the mock should return a tensor that can be sliced like that.
+    # Let's make it (batch_prompts, num_layers_always_1, d_in) -> after slicing -> (batch_prompts, d_in)
+    # The slicing in SAETrainer is `[:, 0, :]` on the output of `next_batch()`.
+    # `next_batch` itself yields batches of shape (prompts, layers, d_in).
+    # So, if train_batch_size_tokens = 4096, context_size=64, prompts = 4096/64 = 64.
+    # The mock should return (64, 1, d_in)
+    num_prompts_in_sae_batch = cfg.train_batch_size_tokens // cfg.context_size
+    mock_batch_on_cpu = torch.randn(num_prompts_in_sae_batch, 1, cfg.d_in).to("cpu")
+    mock_activation_store.next_batch.return_value = mock_batch_on_cpu
+
+    # Mock other necessary attributes/methods if SAETrainer's __init__ or fit calls them
+    # For _train_step, only next_batch and some config attributes might be needed from store.
+    # The store itself is prepared, so it needs to be an object that can be prepared.
+    # Making it a MagicMock might be too simplistic if `prepare` tries to access many attributes.
+    # Let's use a real ActivationsStore but ensure its .next_batch() is patched.
+    # This is safer.
+
+    # Create a real store, then patch its next_batch
+    # Need a dataset for the real store.
+    dummy_dataset = Dataset.from_list([{"text": "example"}] * (num_prompts_in_sae_batch * 2)) # Enough for one batch
+
+    # We need to ensure the store's internal device for its buffers is CPU.
+    # The cfg.act_store_device="cpu" handles this.
+    # The model passed to ActivationsStore is the LLM, not the SAE.
+    # For this test, the LLM isn't used by the part of ActivationsStore we care about for yielding batches to SAE.
+    # So, a simple mock LLM is fine.
+    mock_llm = MagicMock(spec=HookedTransformer)
+    # If tokenizer is accessed:
+    mock_llm.tokenizer = MagicMock()
+    mock_llm.tokenizer.bos_token_id = 0
+
+
+    # Use a real ActivationStore, but we will mock its `next_batch` method after it's prepared.
+    # The key is that the *prepared* store's `next_batch` output is what we care about.
+    # However, Accelerator wraps the object. Mocking after prepare is tricky.
+    # Alternative: Mock the class, then when it's instantiated, replace its next_batch.
+
+    # Let's try mocking the instance's method *before* prepare, then check if prepare preserves the mock
+    # or if we need to mock on the wrapped object.
+    # This usually doesn't work as prepare creates a new wrapper.
+
+    # The simplest for this test:
+    # The ActivationsStore itself is prepared. When its `next_batch` (which is a method on the class)
+    # is called on the *prepared* object, Accelerator should move its output.
+    # So, the mock should be on the original object's `next_batch` to return CPU tensor.
+
+    # Create a real store. Its `next_batch` will internally use a DataLoader on CPU tensors.
+    # This is actually what we want to test: does Accelerator move the CPU tensor from the real store's DataLoader?
+    # So, no need to mock next_batch to return a CPU tensor, it already should.
+
+    # The cfg.act_store_device = "cpu" ensures the internal DataLoader of ActivationsStore yields CPU tensors.
+    # This is the most realistic setup for the test.
+    activation_store_instance = ActivationsStore.from_config(
+        mock_llm, # Mocked LLM
+        cfg,
+        override_dataset=dummy_dataset,
+        accelerator=accelerator # Pass accelerator for its device info if needed by store internally
+    )
+
+
+    # 3. Mock TrainingSAE
+    mock_sae_model = MagicMock(spec=TrainingSAE)
+    # `training_forward_pass` needs to return a TrainStepOutput object.
+    # We need to capture the device of `sae_in`.
+    sae_input_device_capture = []
+    def capture_sae_in_device_forward(*args, sae_in: torch.Tensor, **kwargs):
+        sae_input_device_capture.append(sae_in.device)
+        # Return a dummy TrainStepOutput
+        return TrainStepOutput(
+            sae_in=sae_in, # Pass through to check if it's modified
+            sae_out=torch.zeros_like(sae_in),
+            feature_acts=torch.zeros((sae_in.shape[0], cfg.d_sae), device=sae_in.device),
+            loss=torch.tensor(0.0, device=sae_in.device),
+            mse_loss=torch.tensor(0.0, device=sae_in.device),
+            l1_loss=torch.tensor(0.0, device=sae_in.device),
+            ghost_grad_loss=torch.tensor(0.0, device=sae_in.device),
+            losses={
+                "mse_loss": torch.tensor(0.0, device=sae_in.device),
+                "l1_loss": torch.tensor(0.0, device=sae_in.device),
+                "ghost_grad_loss": torch.tensor(0.0, device=sae_in.device),
+            }
+        )
+    mock_sae_model.training_forward_pass.side_effect = capture_sae_in_device_forward
+    # Make sure the mock SAE has a .cfg attribute if trainer tries to access it
+    mock_sae_model.cfg = MagicMock()
+    mock_sae_model.cfg.normalize_sae_decoder = False # Or True, doesn't matter much for this test
+    mock_sae_model.cfg.device = str(test_device) # So that sae.to(device) inside trainer doesn't complain if called
+                                                 # (though prepare should handle device)
+    # If parameters are accessed by optimizer
+    mock_sae_model.parameters.return_value = [torch.nn.Parameter(torch.randn(10, device=test_device))]
+
+
+    # 4. Instantiate SAETrainer
+    # The SAETrainer will prepare the activation_store_instance and mock_sae_model
+    trainer = SAETrainer(
+        model=MagicMock(spec=HookedTransformer), # Mocked main model, not used in _train_step directly
+        sae=mock_sae_model,
+        activation_store=activation_store_instance,
+        save_checkpoint_fn=lambda *args, **kwargs: None,
+        cfg=cfg,
+        accelerator=accelerator,
+    )
+
+    # 5. Call _train_step (or simplified loop)
+    # The `fit` loop calls `activations_store.next_batch()[:, 0, :]`
+    # Then passes this to `_train_step` as `sae_in`.
+    # The key is that `trainer.activations_store` is the *prepared* version.
+
+    # Simulate one step of the loop in `fit()`:
+    # This ensures we call next_batch() on the *prepared* activation_store.
+    # The output of ActivationsStore.next_batch() is (batch_prompts, num_layers, d_in).
+    # It's then sliced to (batch_prompts, d_in) for the SAE.
+    layer_acts_from_prepared_store = trainer.activations_store.next_batch()
+    sliced_layer_acts = layer_acts_from_prepared_store[:, 0, :]
+
+    trainer._train_step(
+        sae=trainer.sae, # This is the prepared SAE
+        sae_in=sliced_layer_acts # This is the tensor whose device we want to check *inside* training_forward_pass
+    )
+
+    # 6. Assert device
+    assert len(sae_input_device_capture) == 1, "training_forward_pass was not called once."
+    # The device of sae_in *inside* the forward pass of the *prepared* sae model
+    # should be the accelerator's device.
+    assert sae_input_device_capture[0] == accelerator.device, \
+        f"Device of sae_in was {sae_input_device_capture[0]}, expected {accelerator.device}"
+
+    # Also, the original layer_acts_from_prepared_store should be on accelerator.device
+    assert layer_acts_from_prepared_store.device == accelerator.device, \
+        f"Output of prepared_activations_store.next_batch() was on {layer_acts_from_prepared_store.device}, expected {accelerator.device}"
